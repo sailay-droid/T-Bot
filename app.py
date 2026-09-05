@@ -240,50 +240,36 @@ def process_translate(message):
         if not message.document or not message.document.file_name.endswith('.srt'):
             bot.reply_to(message, "❌ .srt ဖိုင် တစ်ခု ပို့ပါ။")
             return
+        
         file_info = message.document
         file_path = bot.get_file(file_info.file_id)
         downloaded_file = bot.download_file(file_path.file_path)
         srt_content = downloaded_file.decode('utf-8')
+        
         status = bot.reply_to(message, "⏳ ဘာသာပြန်နေပါပြီ...")
+        
+        # SRT ဖိုင်ကို ဘာသာပြန်မယ်
         translated_srt = translate_srt_full(srt_content)
-        srt_file = io.BytesIO(translated_srt.encode('utf-8'))
+        
+        # === အရေးကြီး: SRT ဖိုင်ကို Document အဖြစ် ပြန်ပို့မယ် ===
+        srt_bytes = translated_srt.encode('utf-8')
+        srt_file = io.BytesIO(srt_bytes)
         srt_file.name = f"translated_{message.from_user.id}.srt"
-        bot.send_document(message.chat.id, srt_file, caption="✅ ဒီမှာ ဘာသာပြန်ပြီးသား SRT ဖိုင်ပါ။ (မြန်မာလို)")
+        
+        # Document ကို ပို့မယ်
+        bot.send_document(
+            message.chat.id,
+            srt_file,
+            caption="✅ ဒီမှာ ဘာသာပြန်ပြီးသား SRT ဖိုင်ပါ။ (မြန်မာလို)"
+        )
+        
+        # Status Message ကို ဖျက်မယ်
         bot.delete_message(message.chat.id, status.message_id)
+        
     except Exception as e:
+        # Error ဖြစ်ရင် User ကို ပြန်ပြောမယ်
         bot.reply_to(message, f"❌ အမှားဖြစ်သွားတယ်: {str(e)}")
-
-@bot.message_handler(commands=['tts'])
-def tts_command(message):
-    bot.reply_to(message, "🔊 Voiceover လုပ်ချင်တဲ့ စာသားကို ရိုက်ထည့်ပါ။ (မူရင်းအသံ - Nilar)")
-    bot.register_next_step_handler(message, lambda m: process_tts(m, 'my-MM-NilarNeural'))
-
-@bot.message_handler(commands=['tts_nilar'])
-def tts_nilar_command(message):
-    bot.reply_to(message, "🔊 Voiceover လုပ်ချင်တဲ့ စာသားကို ရိုက်ထည့်ပါ။ (Nilar - အမျိုးသမီး)")
-    bot.register_next_step_handler(message, lambda m: process_tts(m, 'my-MM-NilarNeural'))
-
-@bot.message_handler(commands=['tts_thiha'])
-def tts_thiha_command(message):
-    bot.reply_to(message, "🔊 Voiceover လုပ်ချင်တဲ့ စာသားကို ရိုက်ထည့်ပါ။ (Thiha - အမျိုးသား)")
-    bot.register_next_step_handler(message, lambda m: process_tts(m, 'my-MM-ThihaNeural'))
-
-def process_tts(message, voice_name):
-    try:
-        text = message.text
-        if not text:
-            bot.reply_to(message, "❌ စာသားတစ်ခုခု ရိုက်ထည့်ပါ။")
-            return
-        voice_display = "Nilar (အမျိုးသမီး)" if "Nilar" in voice_name else "Thiha (အမျိုးသား)"
-        status = bot.reply_to(message, f"⏳ Voiceover ဖန်တီးနေပါပြီ... (Edge TTS - {voice_display})")
-        combined_audio = generate_voiceover_full(text, voice_name)
-        audio_file = io.BytesIO(combined_audio)
-        audio_file.name = f"voiceover_{message.from_user.id}.mp3"
-        bot.send_audio(message.chat.id, audio_file, caption=f"✅ ဒီမှာ သင့် Voiceover ဖိုင်ပါ။ (Edge TTS - {voice_display})")
-        bot.delete_message(message.chat.id, status.message_id)
-    except Exception as e:
-        bot.reply_to(message, f"❌ အမှားဖြစ်သွားတယ်: {str(e)}")
-
+        
 @bot.message_handler(commands=['recap'])
 def recap_command(message):
     bot.reply_to(message, "🎬 Recap လုပ်ချင်တဲ့ Video ဖိုင် (MP4) ကို ပို့ပါ။")
