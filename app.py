@@ -78,34 +78,24 @@ def transcribe_with_groq(file_path):
 # ၃.၁ Translation - Gemini REST API (ဖြေရှင်းနည်း ၃)
 # ============================================
 def translate_with_gemini(text):
-    """Gemini REST API ကို တိုက်ရိုက်ခေါ်ပြီး မြန်မာလို ဘာသာပြန်မယ်"""
-    url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent"
-    headers = {
-        "Content-Type": "application/json"
-    }
-    params = {
-        "key": GEMINI_API_KEY
-    }
+    """Gemini REST API (gemini-2.5-flash) ကို သုံးပြီး မြန်မာလို ဘာသာပြန်မယ်"""
+    url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent"
+    headers = {"Content-Type": "application/json"}
+    params = {"key": GEMINI_API_KEY}
     
-    # System Instruction ကို Prompt ထဲမှာ တိုက်ရိုက်ထည့်မယ်
     prompt = f"""You are a professional translator. Translate the following English text into natural, fluent Burmese (Myanmar). Use everyday language and maintain the original tone and meaning. Only return the translated text.
 
 Text to translate:
 {text}"""
     
-    data = {
-        "contents": [{
-            "parts": [{"text": prompt}]
-        }]
-    }
-    
-    response = requests.post(url, headers=headers, params=params, json=data, timeout=60)
+    data = {"contents": [{"parts": [{"text": prompt}]}]}
+    response = requests.post(url, headers=headers, params=params, json=data, timeout=120)
     
     if response.status_code == 200:
         result = response.json()
         try:
             return result["candidates"][0]["content"]["parts"][0]["text"]
-        except (KeyError, IndexError):
+        except (KeyError, IndexError) as e:
             raise Exception(f"Unexpected API response: {result}")
     else:
         raise Exception(f"Gemini API Error: {response.status_code} - {response.text}")
@@ -167,8 +157,11 @@ def translate_srt_full(srt_content):
             text_indices.append(i)
     full_text = '\n'.join(text_parts)
     
-    if len(full_text) > 4000:
-        chunks = split_text_into_chunks(full_text, max_chars=4000)
+    # Gemini 2.5 Flash က Input ၁ သန်း Token အထိ လက်ခံတာမို့
+    # စာသားရှည်ရင်လည်း တစ်ခါတည်း ဘာသာပြန်လို့ရပါတယ်
+    # ဒါပေမယ့် Rate Limit အတွက် အပိုင်းလိုက်ခွဲထားတာ အကောင်းဆုံးပါ
+    if len(full_text) > 10000:
+        chunks = split_text_into_chunks(full_text, max_chars=8000)
         translated_parts = []
         for chunk in chunks:
             translated = translate_text_with_fallback(chunk)
