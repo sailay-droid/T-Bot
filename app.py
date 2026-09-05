@@ -93,11 +93,13 @@ def translate_with_libretranslate(text):
         raise Exception(f"LibreTranslate Error: {response.status_code}")
 
 def translate_text_with_fallback(text):
+    """Gemini API ကိုပဲ သုံးပြီး မြန်မာလို ဘာသာပြန်မယ်"""
     try:
         return translate_with_gemini(text)
     except Exception as e:
-        print(f"⚠️ Gemini failed: {e}. Falling back to LibreTranslate...")
-        return translate_with_libretranslate(text)
+        print(f"⚠️ Gemini translation failed: {e}")
+        # ဘာသာပြန်မရရင် မူရင်းစာသားကို ပြန်ပေးမယ်
+        return f"[Translation failed] {text[:200]}..."
 
 # Edge TTS
 import asyncio
