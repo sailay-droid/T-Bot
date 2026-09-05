@@ -4,8 +4,6 @@ import time
 import re
 import requests
 import telebot
-import asyncio
-import edge_tts
 from flask import Flask, request
 
 # ============================================
@@ -37,7 +35,6 @@ if not os.path.exists(TEMP_FOLDER):
 # ၃။ Helper Functions
 # ============================================
 
-# ၃.၁ စာသားကို အပိုင်းလိုက်ခွဲပေးမယ့် Function
 def split_text_into_chunks(text, max_chars=3000):
     if len(text) <= max_chars:
         return [text]
@@ -58,7 +55,6 @@ def split_text_into_chunks(text, max_chars=3000):
         chunks.append(' '.join(current_chunk))
     return chunks
 
-# ၃.၂ Transcription (SRT) - Groq Whisper API
 def transcribe_with_groq(file_path):
     url = "https://api.groq.com/openai/v1/audio/transcriptions"
     headers = {"Authorization": f"Bearer {GROQ_API_KEY}"}
@@ -76,7 +72,6 @@ def transcribe_with_groq(file_path):
     else:
         raise Exception(f"Groq API Error: {response.status_code} - {response.text}")
 
-# ၃.၃ Translation - Gemini (Primary) + LibreTranslate (Fallback)
 def translate_with_gemini(text):
     import google.generativeai as genai
     genai.configure(api_key=GEMINI_API_KEY)
@@ -103,9 +98,11 @@ def translate_text_with_fallback(text):
         print(f"⚠️ Gemini failed: {e}. Falling back to LibreTranslate...")
         return translate_with_libretranslate(text)
 
-# ၃.၄ Text-to-Speech - Edge TTS (မြန်မာအသံ ၂ မျိုး)
+# Edge TTS
+import asyncio
+import edge_tts
+
 async def tts_with_edge(text, voice="my-MM-NilarNeural"):
-    """Edge TTS ကိုသုံးပြီး မြန်မာအသံဖိုင် ထုတ်ပေးမယ်"""
     communicate = edge_tts.Communicate(text, voice)
     audio_data = b""
     async for chunk in communicate.stream():
@@ -114,7 +111,6 @@ async def tts_with_edge(text, voice="my-MM-NilarNeural"):
     return audio_data
 
 def tts_with_gtts_fallback(text):
-    """gTTS ကို Fallback အနေနဲ့ သုံးမယ်"""
     from gtts import gTTS
     tts = gTTS(text[:1000], lang='en', slow=False)
     audio_bytes = io.BytesIO()
@@ -123,11 +119,9 @@ def tts_with_gtts_fallback(text):
     return audio_bytes.read()
 
 def generate_voiceover_full(text, voice_name="my-MM-NilarNeural"):
-    """စာသားရှည်ကြီးကို အပိုင်းလိုက်ခွဲပြီး Edge TTS ခေါ်ကာ အားလုံးပေါင်းပေးမယ်"""
     chunks = split_text_into_chunks(text, max_chars=3000)
     total = len(chunks)
     combined_audio = b''
-
     for i, chunk in enumerate(chunks):
         print(f"🔊 Edge TTS ({voice_name}): {i+1}/{total}")
         try:
@@ -138,10 +132,8 @@ def generate_voiceover_full(text, voice_name="my-MM-NilarNeural"):
             audio_bytes = tts_with_gtts_fallback(chunk)
             combined_audio += audio_bytes
         time.sleep(0.5)
-
     return combined_audio
 
-# ၃.၅ SRT ဖိုင် တစ်ခုလုံးကို ဘာသာပြန်ပေးမယ့် Function
 def translate_srt_full(srt_content):
     lines = srt_content.split('\n')
     text_parts = []
@@ -169,7 +161,7 @@ def translate_srt_full(srt_content):
     return '\n'.join(result_lines)
 
 # ============================================
-# ၄။ Flask Routes (Render အတွက်)
+# ၄။ Flask Routes
 # ============================================
 @app.route('/')
 @app.route('/health')
@@ -189,7 +181,6 @@ def webhook():
 # ၅။ Telegram Bot Handlers
 # ============================================
 
-# /start
 @bot.message_handler(commands=['start'])
 def send_welcome(message):
     bot.reply_to(message,
@@ -204,7 +195,6 @@ def send_welcome(message):
         "💡 သုံးနည်း: Command ကိုနှိပ်ပြီး ဖိုင်/စာသား ပို့ပါ။",
         parse_mode='Markdown')
 
-# /transcribe
 @bot.message_handler(commands=['transcribe'])
 def transcribe_command(message):
     bot.reply_to(message, "🎤 Video/Audio ဖိုင် (MP4, MP3) ကို ပို့ပါ။")
@@ -239,7 +229,6 @@ def process_transcribe(message):
     except Exception as e:
         bot.reply_to(message, f"❌ အမှားဖြစ်သွားတယ်: {str(e)}")
 
-# /translate
 @bot.message_handler(commands=['translate'])
 def translate_command(message):
     bot.reply_to(message, "🌍 SRT ဖိုင် (.srt) ကို ပို့ပါ။")
@@ -263,19 +252,16 @@ def process_translate(message):
     except Exception as e:
         bot.reply_to(message, f"❌ အမှားဖြစ်သွားတယ်: {str(e)}")
 
-# /tts (Default - Nilar)
 @bot.message_handler(commands=['tts'])
 def tts_command(message):
     bot.reply_to(message, "🔊 Voiceover လုပ်ချင်တဲ့ စာသားကို ရိုက်ထည့်ပါ။ (မူရင်းအသံ - Nilar)")
     bot.register_next_step_handler(message, lambda m: process_tts(m, 'my-MM-NilarNeural'))
 
-# /tts_nilar
 @bot.message_handler(commands=['tts_nilar'])
 def tts_nilar_command(message):
     bot.reply_to(message, "🔊 Voiceover လုပ်ချင်တဲ့ စာသားကို ရိုက်ထည့်ပါ။ (Nilar - အမျိုးသမီး)")
     bot.register_next_step_handler(message, lambda m: process_tts(m, 'my-MM-NilarNeural'))
 
-# /tts_thiha
 @bot.message_handler(commands=['tts_thiha'])
 def tts_thiha_command(message):
     bot.reply_to(message, "🔊 Voiceover လုပ်ချင်တဲ့ စာသားကို ရိုက်ထည့်ပါ။ (Thiha - အမျိုးသား)")
@@ -297,7 +283,6 @@ def process_tts(message, voice_name):
     except Exception as e:
         bot.reply_to(message, f"❌ အမှားဖြစ်သွားတယ်: {str(e)}")
 
-# /recap
 @bot.message_handler(commands=['recap'])
 def recap_command(message):
     bot.reply_to(message, "🎬 Recap လုပ်ချင်တဲ့ Video ဖိုင် (MP4) ကို ပို့ပါ။")
@@ -335,16 +320,21 @@ def process_recap(message):
         bot.reply_to(message, f"❌ အမှားဖြစ်သွားတယ်: {str(e)}")
 
 # ============================================
-# ၆။ Main Entry Point
+# ၆။ Webhook သတ်မှတ်ခြင်း (Gunicorn စတင်တာနဲ့)
 # ============================================
-if __name__ == '__main__':
-    # Polling Mode ကို သုံးမယ်
-    print("🔄 Using polling mode...")
+if RENDER_URL:
+    webhook_url = f"{RENDER_URL}/webhook"
     bot.remove_webhook()
-    
-    # Polling ကို Background Thread မှာ run မယ်
-    import threading
-    threading.Thread(target=bot.infinity_polling, daemon=True).start()
-    
+    bot.set_webhook(url=webhook_url)
+    print(f"✅ Webhook set to: {webhook_url}")
+else:
+    print("⚠️ RENDER_EXTERNAL_URL not set! Webhook not configured.")
+
+# ============================================
+# ၇။ Main Entry Point (Flask)
+# ============================================
+# Gunicorn က app:app ကို ခေါ်တာမို့ __main__ က မပါတော့ဘူး
+# ဒါပေမယ့် python app.py နဲ့ စမ်းချင်ရင်လည်း ရအောင် ထည့်ထားတယ်
+if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
     app.run(host='0.0.0.0', port=port)
