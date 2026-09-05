@@ -116,14 +116,11 @@ Burmese:"""
         raise Exception(f"Gemini API Error: {response.status_code} - {response.text}")
 
 def translate_text_with_fallback(text):
-    """Gemini ကိုပဲ သုံးမယ် (Error ဖြစ်ရင် မူရင်းစာသားကို ပြန်ပေးမယ်)"""
+    """ဒါက သေးငယ်တဲ့ စာသားအတွက် သုံးမယ် (အခုတော့ သိပ်မသုံးတော့ဘူး)"""
     if not text or len(text.strip()) < 2:
         return text
-    
-    # မြန်မာစာလုံးပါရင် မဘာသာပြန်တော့ဘူး
     if any('\u1000' <= c <= '\u109F' for c in text):
         return text
-    
     try:
         return translate_with_gemini(text)
     except Exception as e:
@@ -131,39 +128,83 @@ def translate_text_with_fallback(text):
         return text
 
 # ============================================
-# ၆။ SRT ဖိုင် ဘာသာပြန်ခြင်း (စာကြောင်းတိုင်း သီးခြား)
+# SRT ဖိုင် ဘာသာပြန်ခြင်း (Batch Translation)
 # ============================================
+
+def translate_with_gemini_batch(text):
+    """စာကြောင်းအများကြီးကို တစ်ခါတည်း ဘာသာပြန်မယ်"""
+    if not text or len(text.strip()) < 2:
+        return text
+    
+    url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-3.6-flash:generateContent"
+    headers = {"Content-Type": "application/json"}
+    params = {"key": GEMINI_API_KEY}
+    
+    prompt = f"""Translate the following English lines to Burmese (Myanmar). Each line is separated by a newline. 
+Keep the same number of lines. Only return the translated text, no explanations.
+
+English lines:
+{text}
+
+Burmese lines:"""
+    
+    data = {"contents": [{"parts": [{"text": prompt}]}]}
+    response = requests.post(url, headers=headers, params=params, json=data, timeout=120)
+    
+    if response.status_code == 200:
+        result = response.json()
+        try:
+            translated = result["candidates"][0]["content"]["parts"][0]["text"].strip()
+            if not translated:
+                return text
+            return translated
+        except (KeyError, IndexError) as e:
+            raise Exception(f"Unexpected API response: {result}")
+    else:
+        raise Exception(f"Gemini API Error: {response.status_code} - {response.text}")
+
 def translate_srt_full(srt_content):
-    """SRT ဖိုင်ကို စာကြောင်းတစ်ကြောင်းချင်းစီ ဘာသာပြန်မယ်"""
+    """SRT ဖိုင်ကို အစုလိုက်ပေါင်းပြီး ဘာသာပြန်မယ် (Rate Limit ကိုရှောင်ဖို့)"""
     lines = srt_content.split('\n')
     
     # စာသားတွေရှိတဲ့ နေရာတွေကို ရှာမယ်
     text_indices = []
+    text_lines = []
     for i, line in enumerate(lines):
         if line.strip() and not line.strip().isdigit() and '-->' not in line:
-            text_indices.append(i)
+            # မြန်မာလိုဖြစ်နေရင် ကျော်မယ်
+            if not any('\u1000' <= c <= '\u109F' for c in line):
+                text_indices.append(i)
+                text_lines.append(line)
     
+    # စာကြောင်းတွေကို အစုလိုက်ပေါင်းမယ် (တစ်စုကို ၅၀ ကြောင်း)
+    BATCH_SIZE = 50
     result_lines = lines.copy()
     
-    for idx in text_indices:
-        original_text = lines[idx]
-        if not original_text.strip():
-            continue
+    for batch_start in range(0, len(text_lines), BATCH_SIZE):
+        batch_end = min(batch_start + BATCH_SIZE, len(text_lines))
+        batch_lines = text_lines[batch_start:batch_end]
         
-        # ဒီစာကြောင်းက မြန်မာလိုရှိပြီးသားလား စစ်မယ်
-        has_myanmar = any('\u1000' <= c <= '\u109F' for c in original_text)
-        if has_myanmar:
-            continue  # မြန်မာလိုဆိုရင် ကျော်မယ်
+        # စာကြောင်းတွေကို ပေါင်းပြီး ဘာသာပြန်မယ်
+        combined_text = '\n'.join(batch_lines)
         
         try:
-            translated = translate_text_with_fallback(original_text)
-            # ဘာသာပြန်ပြီးသားစာက ဗလာမဟုတ်ရင် အစားထိုးမယ်
-            if translated and translated.strip():
-                result_lines[idx] = translated
-            time.sleep(0.2)  # Rate Limit အတွက်
+            translated = translate_with_gemini_batch(combined_text)
+            # ဘာသာပြန်ပြီးသား စာကြောင်းတွေကို ခွဲမယ်
+            translated_lines = translated.split('\n')
+            
+            # မူရင်းနေရာတွေမှာ အစားထိုးမယ်
+            for j, idx in enumerate(text_indices[batch_start:batch_end]):
+                if j < len(translated_lines):
+                    translated_text = translated_lines[j].strip()
+                    if translated_text:
+                        result_lines[idx] = translated_text
         except Exception as e:
-            print(f"⚠️ Failed to translate line {idx}: {e}")
+            print(f"⚠️ Batch translation failed: {e}")
             # မရရင် မူရင်းအတိုင်းထားမယ်
+        
+        # Rate Limit မဖြစ်အောင် ခဏစောင့်မယ် (၃ စက္ကန့်)
+        time.sleep(3)
     
     return '\n'.join(result_lines)
 
