@@ -24,7 +24,8 @@ if not GEMINI_API_KEY:
 # ============================================
 # ၂။ Flask & Bot Setup
 # ============================================
-bot = telebot.TeleBot(BOT_TOKEN)
+# ဒီလိုပြင်ပါ
+bot = telebot.TeleBot(BOT_TOKEN, threaded=False)
 app = Flask(__name__)
 
 TEMP_FOLDER = "/tmp/"
