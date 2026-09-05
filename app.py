@@ -2,14 +2,14 @@ import os
 import io
 import time
 import re
+import asyncio
 import requests
 import telebot
-import asyncio
 import edge_tts
 from flask import Flask, request
 
 # ============================================
-# ၁။ Environment Variables များကို ဖတ်ယူခြင်း
+# ၁။ Environment Variables
 # ============================================
 BOT_TOKEN = os.environ.get('BOT_TOKEN')
 GROQ_API_KEY = os.environ.get('GROQ_API_KEY')
@@ -24,7 +24,7 @@ if not GEMINI_API_KEY:
     raise ValueError("GEMINI_API_KEY environment variable not set!")
 
 # ============================================
-# ၂။ Flask & Bot Setup (Webhook အတွက် threaded=False)
+# ၂။ Flask & Bot Setup
 # ============================================
 bot = telebot.TeleBot(BOT_TOKEN, threaded=False)
 app = Flask(__name__)
@@ -38,7 +38,6 @@ if not os.path.exists(TEMP_FOLDER):
 # ============================================
 
 def split_text_into_chunks(text, max_chars=3000):
-    """စာသားရှည်ကြီးကို ဝါကျအတိုင်း ခွဲပေးမယ် (TTS အတွက်)"""
     if len(text) <= max_chars:
         return [text]
     chunks = []
@@ -59,7 +58,7 @@ def split_text_into_chunks(text, max_chars=3000):
     return chunks
 
 # ============================================
-# ၄။ Transcription (SRT) - Groq Whisper API
+# ၄။ Transcription - Groq Whisper API
 # ============================================
 def transcribe_with_groq(file_path):
     url = "https://api.groq.com/openai/v1/audio/transcriptions"
@@ -79,60 +78,10 @@ def transcribe_with_groq(file_path):
         raise Exception(f"Groq API Error: {response.status_code} - {response.text}")
 
 # ============================================
-# ၅။ Translation - Gemini REST API (gemini-3.6-flash)
+# ၅။ Translation - Gemini REST API (async with retry)
 # ============================================
-def translate_with_gemini(text):
-    """Gemini REST API ကို သုံးပြီး အင်္ဂလိပ်စာသားကို မြန်မာလို ဘာသာပြန်မယ်"""
-    if not text or len(text.strip()) < 2:
-        return text
-    
-    # မြန်မာစာလုံးပါရင် ဘာသာပြန်တာကို ကျော်မယ်
-    if any('\u1000' <= c <= '\u109F' for c in text):
-        return text
-    
-    url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-3.6-flash:generateContent"
-    headers = {"Content-Type": "application/json"}
-    params = {"key": GEMINI_API_KEY}
-    
-    prompt = f"""Translate this English text to Burmese (Myanmar). Only return the translated text. No explanations.
-
-English: {text}
-
-Burmese:"""
-    
-    data = {"contents": [{"parts": [{"text": prompt}]}]}
-    response = requests.post(url, headers=headers, params=params, json=data, timeout=60)
-    
-    if response.status_code == 200:
-        result = response.json()
-        try:
-            translated = result["candidates"][0]["content"]["parts"][0]["text"].strip()
-            if not translated:
-                return text
-            return translated
-        except (KeyError, IndexError) as e:
-            raise Exception(f"Unexpected API response: {result}")
-    else:
-        raise Exception(f"Gemini API Error: {response.status_code} - {response.text}")
-
-def translate_text_with_fallback(text):
-    """ဒါက သေးငယ်တဲ့ စာသားအတွက် သုံးမယ် (အခုတော့ သိပ်မသုံးတော့ဘူး)"""
-    if not text or len(text.strip()) < 2:
-        return text
-    if any('\u1000' <= c <= '\u109F' for c in text):
-        return text
-    try:
-        return translate_with_gemini(text)
-    except Exception as e:
-        print(f"⚠️ Gemini failed: {e}")
-        return text
-
-# ============================================
-# SRT ဖိုင် ဘာသာပြန်ခြင်း (Batch Translation)
-# ============================================
-
-def translate_with_gemini_batch(text, retries=5):
-    """စာကြောင်းအများကြီးကို တစ်ခါတည်း ဘာသာပြန်မယ် (Retry with backoff)"""
+async def translate_with_gemini_batch(text, retries=3):
+    """စာကြောင်းအများကြီးကို တစ်ခါတည်း ဘာသာပြန်မယ် (async version)"""
     if not text or len(text.strip()) < 2:
         return text
     
@@ -172,9 +121,9 @@ Burmese lines:"""
                 if match:
                     wait_time = float(match.group(1)) + 1
                 else:
-                    wait_time = 2 ** attempt  # exponential backoff
+                    wait_time = 2 ** attempt
                 print(f"⚠️ Rate limit exceeded. Waiting {wait_time}s before retry...")
-                time.sleep(wait_time)
+                await asyncio.sleep(wait_time)
                 continue
             else:
                 raise Exception(f"Gemini API Error: {response.status_code} - {response.text}")
@@ -182,10 +131,14 @@ Burmese lines:"""
             if attempt == retries - 1:
                 raise
             print(f"⚠️ Attempt {attempt+1} failed: {e}. Retrying...")
-            time.sleep(2 ** attempt)
+            await asyncio.sleep(2 ** attempt)
     
     return text
-def translate_srt_full(srt_content):
+
+# ============================================
+# ၆။ SRT ဖိုင် ဘာသာပြန်ခြင်း (async)
+# ============================================
+async def translate_srt_full(srt_content):
     """SRT ဖိုင်ကို အစုလိုက်ပေါင်းပြီး ဘာသာပြန်မယ် 
        (မြန်မာလိုရှိပြီးသားစာကြောင်းတွေကို ကျော်မယ်)"""
     lines = srt_content.split('\n')
@@ -204,7 +157,7 @@ def translate_srt_full(srt_content):
     if not text_lines:
         return srt_content
     
-    # စာကြောင်းတွေကို အစုလိုက်ပေါင်းမယ် (တစ်စုကို ၂၀ ကြောင်း - Rate Limit အတွက်)
+    # စာကြောင်းတွေကို အစုလိုက်ပေါင်းမယ် (တစ်စုကို ၂၀ ကြောင်း)
     BATCH_SIZE = 20
     result_lines = lines.copy()
     
@@ -215,7 +168,7 @@ def translate_srt_full(srt_content):
         combined_text = '\n'.join(batch_lines)
         
         try:
-            translated = translate_with_gemini_batch(combined_text)
+            translated = await translate_with_gemini_batch(combined_text)
             translated_lines = translated.split('\n')
             
             for j, idx in enumerate(text_indices[batch_start:batch_end]):
@@ -227,10 +180,11 @@ def translate_srt_full(srt_content):
             print(f"⚠️ Batch translation failed: {e}")
             # မရရင် မူရင်းအတိုင်းထားမယ်
         
-        # နောက် batch မစခင် ခဏစောင့်မယ်
-        time.sleep(2)
+        # နောက် batch မစခင် ခဏစောင့်မယ် (asyncio.sleep)
+        await asyncio.sleep(2)
     
     return '\n'.join(result_lines)
+
 # ============================================
 # ၇။ Text-to-Speech - Edge TTS
 # ============================================
@@ -293,7 +247,7 @@ def send_welcome(message):
         "🎬 **MyRCBot - Movie Recap Assistant**\n\n"
         "📌 **Command များ:**\n"
         "1️⃣ `/transcribe` - Video/Audio ကနေ SRT Transcript ထုတ်ပေးမယ်\n"
-        "2️⃣ `/translate` - SRT ဖိုင် မြန်မာလို ဘာသာပြန်ပေးမယ် (စာကြောင်းတိုင်း)\n"
+        "2️⃣ `/translate` - SRT ဖိုင် မြန်မာလို ဘာသာပြန်ပေးမယ်\n"
         "3️⃣ `/tts` - စာသားကို Voiceover (Nilar) ပြောင်းပေးမယ်\n"
         "4️⃣ `/tts_nilar` - Nilar (အမျိုးသမီး) အသံနဲ့ Voiceover\n"
         "5️⃣ `/tts_thiha` - Thiha (အမျိုးသား) အသံနဲ့ Voiceover\n"
@@ -302,7 +256,7 @@ def send_welcome(message):
         parse_mode='Markdown')
 
 # --------------------------------------------------
-# /transcribe - Video/Audio ကနေ SRT ထုတ်ခြင်း
+# /transcribe
 # --------------------------------------------------
 @bot.message_handler(commands=['transcribe'])
 def transcribe_command(message):
@@ -339,11 +293,11 @@ def process_transcribe(message):
         bot.reply_to(message, f"❌ အမှားဖြစ်သွားတယ်: {str(e)}")
 
 # --------------------------------------------------
-# /translate - SRT ဖိုင် ဘာသာပြန်ခြင်း (စာကြောင်းတိုင်း)
+# /translate (async)
 # --------------------------------------------------
 @bot.message_handler(commands=['translate'])
 def translate_command(message):
-    msg = bot.reply_to(message, "🌍 SRT ဖိုင် (.srt) ကို ပို့ပါ။ (စာကြောင်းတိုင်းကို မြန်မာလို ဘာသာပြန်ပေးမယ်)")
+    msg = bot.reply_to(message, "🌍 SRT ဖိုင် (.srt) ကို ပို့ပါ။ (မြန်မာလိုရှိပြီးသားစာကြောင်းတွေကို ကျော်မယ်)")
     bot.register_next_step_handler(msg, process_translate)
 
 def process_translate(message):
@@ -360,14 +314,12 @@ def process_translate(message):
         downloaded_file = bot.download_file(file_path.file_path)
         srt_content = downloaded_file.decode('utf-8')
         
-        # စာကြောင်းအရေအတွက် တွက်ပြီး User ကို အကြောင်းကြားမယ်
         line_count = len([line for line in srt_content.split('\n') if line.strip()])
         status = bot.reply_to(message, f"⏳ ဘာသာပြန်နေပါပြီ... (စာကြောင်း {line_count} ကြောင်း) ခဏစောင့်ပါ။")
         
-        # SRT ဖိုင်ကို ဘာသာပြန်မယ်
-        translated_srt = translate_srt_full(srt_content)
+        # async function ကို asyncio.run() နဲ့ ခေါ်မယ်
+        translated_srt = asyncio.run(translate_srt_full(srt_content))
         
-        # Document ကို ပြန်ပို့မယ်
         srt_bytes = translated_srt.encode('utf-8')
         srt_file = io.BytesIO(srt_bytes)
         srt_file.seek(0)
@@ -385,7 +337,7 @@ def process_translate(message):
         print(f"❌ process_translate error: {e}")
 
 # --------------------------------------------------
-# /tts - Voiceover (Edge TTS)
+# /tts
 # --------------------------------------------------
 @bot.message_handler(commands=['tts'])
 def tts_command(message):
@@ -419,7 +371,7 @@ def process_tts(message, voice_name):
         bot.reply_to(message, f"❌ အမှားဖြစ်သွားတယ်: {str(e)}")
 
 # --------------------------------------------------
-# /recap - Video ကနေ ဇာတ်လမ်းအနှစ်ချုပ် ထုတ်ခြင်း
+# /recap
 # --------------------------------------------------
 @bot.message_handler(commands=['recap'])
 def recap_command(message):
@@ -444,7 +396,6 @@ def process_recap(message):
         transcript = transcribe_with_groq(temp_file)
         os.remove(temp_file)
         
-        # Recap အတွက် Gemini 3.6 Flash ကို သုံးမယ်
         url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-3.6-flash:generateContent"
         params = {"key": GEMINI_API_KEY}
         prompt = f"""အောက်ပါ Video Transcript ကိုဖတ်ပြီး ရုပ်ရှင်ဇာတ်လမ်းအနှစ်ချုပ် (Movie Recap) ပုံစံနဲ့ မြန်မာလို ရေးပါ။ 
@@ -466,7 +417,7 @@ def process_recap(message):
         bot.reply_to(message, f"❌ အမှားဖြစ်သွားတယ်: {str(e)}")
 
 # ============================================
-# ၁၀။ Webhook သတ်မှတ်ခြင်း (Gunicorn စတင်တာနဲ့)
+# ၁၀။ Webhook သတ်မှတ်ခြင်း
 # ============================================
 if RENDER_URL:
     webhook_url = f"{RENDER_URL}/webhook"
@@ -477,7 +428,7 @@ else:
     print("⚠️ RENDER_EXTERNAL_URL not set! Webhook not configured.")
 
 # ============================================
-# ၁၁။ Main Entry Point (Flask)
+# ၁၁။ Main Entry Point
 # ============================================
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
