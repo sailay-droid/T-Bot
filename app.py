@@ -131,8 +131,8 @@ def translate_text_with_fallback(text):
 # SRT ဖိုင် ဘာသာပြန်ခြင်း (Batch Translation)
 # ============================================
 
-def translate_with_gemini_batch(text):
-    """စာကြောင်းအများကြီးကို တစ်ခါတည်း ဘာသာပြန်မယ်"""
+def translate_with_gemini_batch(text, retries=5):
+    """စာကြောင်းအများကြီးကို တစ်ခါတည်း ဘာသာပြန်မယ် (Retry with backoff)"""
     if not text or len(text.strip()) < 2:
         return text
     
@@ -149,22 +149,45 @@ English lines:
 Burmese lines:"""
     
     data = {"contents": [{"parts": [{"text": prompt}]}]}
-    response = requests.post(url, headers=headers, params=params, json=data, timeout=120)
     
-    if response.status_code == 200:
-        result = response.json()
+    for attempt in range(retries):
         try:
-            translated = result["candidates"][0]["content"]["parts"][0]["text"].strip()
-            if not translated:
-                return text
-            return translated
-        except (KeyError, IndexError) as e:
-            raise Exception(f"Unexpected API response: {result}")
-    else:
-        raise Exception(f"Gemini API Error: {response.status_code} - {response.text}")
-
+            response = requests.post(url, headers=headers, params=params, json=data, timeout=120)
+            
+            if response.status_code == 200:
+                result = response.json()
+                try:
+                    translated = result["candidates"][0]["content"]["parts"][0]["text"].strip()
+                    if not translated:
+                        return text
+                    return translated
+                except (KeyError, IndexError) as e:
+                    raise Exception(f"Unexpected API response: {result}")
+            elif response.status_code == 429:
+                # Rate Limit - retry_after ကို ဖတ်ပြီး စောင့်မယ်
+                error_data = response.json()
+                error_msg = error_data.get("error", {}).get("message", "")
+                import re
+                match = re.search(r'Please retry in ([\d.]+)s', error_msg)
+                if match:
+                    wait_time = float(match.group(1)) + 1
+                else:
+                    wait_time = 2 ** attempt  # exponential backoff
+                print(f"⚠️ Rate limit exceeded. Waiting {wait_time}s before retry...")
+                time.sleep(wait_time)
+                continue
+            else:
+                raise Exception(f"Gemini API Error: {response.status_code} - {response.text}")
+        except Exception as e:
+            if attempt == retries - 1:
+                raise
+            print(f"⚠️ Attempt {attempt+1} failed: {e}. Retrying...")
+            time.sleep(2 ** attempt)
+    
+    return text
 def translate_srt_full(srt_content):
-    """SRT ဖိုင်ကို အစုလိုက်ပေါင်းပြီး ဘာသာပြန်မယ် (Rate Limit ကိုရှောင်ဖို့)"""
+    """SRT ဖိုင်ကို အစုလိုက်ပေါင်းပြီး ဘာသာပြန်မယ် 
+       (မြန်မာလိုရှိပြီးသားစာကြောင်းတွေကို ကျော်မယ်)"""
     lines = srt_content.split('\n')
     
     # စာသားတွေရှိတဲ့ နေရာတွေကို ရှာမယ်
@@ -172,28 +195,29 @@ def translate_srt_full(srt_content):
     text_lines = []
     for i, line in enumerate(lines):
         if line.strip() and not line.strip().isdigit() and '-->' not in line:
-            # မြန်မာလိုဖြစ်နေရင် ကျော်မယ်
+            # မြန်မာစာလုံးရှိရင် ဘာသာပြန်တာကို ကျော်မယ်
             if not any('\u1000' <= c <= '\u109F' for c in line):
                 text_indices.append(i)
                 text_lines.append(line)
     
-    # စာကြောင်းတွေကို အစုလိုက်ပေါင်းမယ် (တစ်စုကို ၅၀ ကြောင်း)
-    BATCH_SIZE = 50
+    # ဘာသာပြန်စရာမရှိရင် မူရင်းကိုပဲ ပြန်ပေးမယ်
+    if not text_lines:
+        return srt_content
+    
+    # စာကြောင်းတွေကို အစုလိုက်ပေါင်းမယ် (တစ်စုကို ၂၀ ကြောင်း - Rate Limit အတွက်)
+    BATCH_SIZE = 20
     result_lines = lines.copy()
     
     for batch_start in range(0, len(text_lines), BATCH_SIZE):
         batch_end = min(batch_start + BATCH_SIZE, len(text_lines))
         batch_lines = text_lines[batch_start:batch_end]
         
-        # စာကြောင်းတွေကို ပေါင်းပြီး ဘာသာပြန်မယ်
         combined_text = '\n'.join(batch_lines)
         
         try:
             translated = translate_with_gemini_batch(combined_text)
-            # ဘာသာပြန်ပြီးသား စာကြောင်းတွေကို ခွဲမယ်
             translated_lines = translated.split('\n')
             
-            # မူရင်းနေရာတွေမှာ အစားထိုးမယ်
             for j, idx in enumerate(text_indices[batch_start:batch_end]):
                 if j < len(translated_lines):
                     translated_text = translated_lines[j].strip()
@@ -203,11 +227,10 @@ def translate_srt_full(srt_content):
             print(f"⚠️ Batch translation failed: {e}")
             # မရရင် မူရင်းအတိုင်းထားမယ်
         
-        # Rate Limit မဖြစ်အောင် ခဏစောင့်မယ် (၃ စက္ကန့်)
-        time.sleep(3)
+        # နောက် batch မစခင် ခဏစောင့်မယ်
+        time.sleep(2)
     
     return '\n'.join(result_lines)
-
 # ============================================
 # ၇။ Text-to-Speech - Edge TTS
 # ============================================
