@@ -5,7 +5,6 @@ import re
 import requests
 import telebot
 from flask import Flask, request
-from telebot.types import InputFile
 
 # ============================================
 # ၁။ Environment Variables များကို ဖတ်ယူခြင်း
@@ -13,7 +12,8 @@ from telebot.types import InputFile
 BOT_TOKEN = os.environ.get('BOT_TOKEN')
 GROQ_API_KEY = os.environ.get('GROQ_API_KEY')
 GEMINI_API_KEY = os.environ.get('GEMINI_API_KEY')
-FISH_API_KEY = os.environ.get('FISH_API_KEY')
+AZURE_SPEECH_KEY = os.environ.get('AZURE_SPEECH_KEY')
+AZURE_SPEECH_REGION = os.environ.get('AZURE_SPEECH_REGION')
 RENDER_URL = os.environ.get('RENDER_EXTERNAL_URL', '')
 
 # API Key မပါရင် Error ထုတ်မယ်
@@ -23,6 +23,8 @@ if not GROQ_API_KEY:
     raise ValueError("GROQ_API_KEY environment variable not set!")
 if not GEMINI_API_KEY:
     raise ValueError("GEMINI_API_KEY environment variable not set!")
+if not AZURE_SPEECH_KEY or not AZURE_SPEECH_REGION:
+    raise ValueError("AZURE_SPEECH_KEY and AZURE_SPEECH_REGION must be set!")
 
 # ============================================
 # ၂။ Flask & Bot Setup
@@ -30,13 +32,13 @@ if not GEMINI_API_KEY:
 bot = telebot.TeleBot(BOT_TOKEN)
 app = Flask(__name__)
 
-# ယာယီဖိုင်သိမ်းမယ့် နေရာ (Render အတွက် /tmp က အကောင်းဆုံး)
+# ယာယီဖိုင်သိမ်းမယ့် နေရာ
 TEMP_FOLDER = "/tmp/"
 if not os.path.exists(TEMP_FOLDER):
     os.makedirs(TEMP_FOLDER)
 
 # ============================================
-# ၃။ Helper Functions (အကူအညီပေးမယ့် Function များ)
+# ၃။ Helper Functions
 # ============================================
 
 # ၃.၁ စာသားကို အပိုင်းလိုက်ခွဲပေးမယ့် Function
@@ -71,7 +73,6 @@ def transcribe_with_groq(file_path):
     url = "https://api.groq.com/openai/v1/audio/transcriptions"
     headers = {"Authorization": f"Bearer {GROQ_API_KEY}"}
     
-    # ဖိုင်အမျိုးအစားကို ခွဲခြားသတ်မှတ်မယ်
     filename = os.path.basename(file_path)
     if filename.endswith('.mp4') or filename.endswith('.avi') or filename.endswith('.mov'):
         mime_type = 'video/mp4'
@@ -124,50 +125,40 @@ def translate_text_with_fallback(text):
         print(f"⚠️ Gemini failed: {e}. Falling back to LibreTranslate...")
         return translate_with_libretranslate(text)
 
-# ၃.၄ Text-to-Speech - Fish Audio (Primary) + gTTS (Fallback)
-def tts_with_fish(text):
-    """Fish Audio API ကိုသုံးပြီး အသံဖိုင် (MP3 Bytes) ပြန်ပေးမယ်"""
-    url = "https://api.fish.audio/v1/tts"
+# ၃.၄ Text-to-Speech - Microsoft Azure Neural TTS (အသံ ၂ မျိုး ရွေးချယ်နိုင်)
+def tts_with_azure(text, voice_name='my-MM-NilarNeural'):
+    """Microsoft Azure Neural TTS ကို သုံးပြီး မြန်မာအသံဖိုင် ထုတ်ပေးမယ်"""
+    url = f"https://{AZURE_SPEECH_REGION}.tts.speech.microsoft.com/cognitiveservices/v1"
     headers = {
-        "Authorization": f"Bearer {FISH_API_KEY}",
-        "Content-Type": "application/json"
+        "Ocp-Apim-Subscription-Key": AZURE_SPEECH_KEY,
+        "Content-Type": "application/ssml+xml",
+        "X-Microsoft-OutputFormat": "audio-24khz-48kbitrate-mono-mp3",
+        "User-Agent": "MyRCBot"
     }
-    data = {
-        "text": text,
-        "model": "S2.1Pro",
-        "language": "my"  # မြန်မာလိုရနိုင်ရင်
-    }
-    response = requests.post(url, json=data, headers=headers, timeout=60)
+    
+    # SSML ပုံစံနဲ့ စာသားကို ထည့်ပို့မယ်
+    ssml = f"""<speak version='1.0' xmlns='http://www.w3.org/2001/10/synthesis' xml:lang='my-MM'>
+        <voice name='{voice_name}'>{text}</voice>
+    </speak>"""
+    
+    response = requests.post(url, headers=headers, data=ssml.encode('utf-8'), timeout=60)
+    
     if response.status_code == 200:
         return response.content
     else:
-        raise Exception(f"Fish API Error: {response.status_code}")
+        raise Exception(f"Azure TTS Error: {response.status_code} - {response.text}")
 
-def tts_with_gtts(text):
-    """gTTS (အင်္ဂလိပ်လိုပဲ) ကို Fallback အနေနဲ့ သုံးမယ်"""
-    from gtts import gTTS
-    tts = gTTS(text[:1000], lang='en', slow=False)
-    audio_bytes = io.BytesIO()
-    tts.write_to_fp(audio_bytes)
-    audio_bytes.seek(0)
-    return audio_bytes.read()
-
-def generate_voiceover_full(text):
-    """စာသားရှည်ကြီးကို အပိုင်းလိုက်ခွဲပြီး TTS ခေါ်ကာ အားလုံးပေါင်းပေးမယ်"""
+def generate_voiceover_full(text, voice_name='my-MM-NilarNeural'):
+    """စာသားရှည်ကြီးကို အပိုင်းလိုက်ခွဲပြီး Azure TTS ခေါ်ကာ အားလုံးပေါင်းပေးမယ်"""
     chunks = split_text_into_chunks(text, max_chars=3000)
     total = len(chunks)
     combined_audio = b''
     
     for i, chunk in enumerate(chunks):
-        print(f"🔊 TTS: {i+1}/{total}")
-        try:
-            audio_bytes = tts_with_fish(chunk)
-        except Exception as e:
-            print(f"⚠️ Fish TTS failed: {e}. Falling back to gTTS...")
-            audio_bytes = tts_with_gtts(chunk)
-        
+        print(f"🔊 Azure TTS ({voice_name}): {i+1}/{total}")
+        audio_bytes = tts_with_azure(chunk, voice_name)
         combined_audio += audio_bytes
-        time.sleep(1)  # Rate Limit အတွက်
+        time.sleep(0.5)  # Rate Limit အတွက်
     
     return combined_audio
 
@@ -176,30 +167,26 @@ def translate_srt_full(srt_content):
     """SRT ဖိုင်ထဲက စာသားတွေကို ဘာသာပြန်ပြီး SRT ပုံစံအတိုင်း ပြန်ထုတ်ပေးမယ်"""
     lines = srt_content.split('\n')
     
-    # စာသားတွေကို စုမယ်
     text_parts = []
     text_indices = []
     for i, line in enumerate(lines):
-        # နံပါတ်၊ Timestamp မဟုတ်တဲ့ စာကြောင်းတွေကို ရွေးမယ်
         if line.strip() and not line.strip().isdigit() and '-->' not in line:
             text_parts.append(line.strip())
             text_indices.append(i)
     
     full_text = '\n'.join(text_parts)
     
-    # စာသားရှည်ရင် အပိုင်းလိုက်ခွဲပြီး ဘာသာပြန်မယ်
     if len(full_text) > 4000:
         chunks = split_text_into_chunks(full_text, max_chars=4000)
         translated_parts = []
         for chunk in chunks:
             translated = translate_text_with_fallback(chunk)
             translated_parts.append(translated)
-            time.sleep(0.5)  # Rate Limit အတွက်
+            time.sleep(0.5)
         translated_text = ' '.join(translated_parts)
     else:
         translated_text = translate_text_with_fallback(full_text)
     
-    # ဘာသာပြန်ပြီးသား စာသားကို မူလနေရာတွေမှာ အစားထိုးမယ်
     translated_lines = translated_text.split('\n')
     result_lines = lines.copy()
     for idx, pos in enumerate(text_indices):
@@ -236,9 +223,11 @@ def send_welcome(message):
         "🎬 **MyRCBot - Movie Recap Assistant**\n\n"
         "📌 **Command များ:**\n"
         "1️⃣ `/transcribe` - Video/Audio ကနေ SRT Transcript ထုတ်ပေးမယ်\n"
-        "2️⃣ `/translate` - SRT ဖိုင် ဘာသာပြန်ပေးမယ် (စာရှည်ရင် Auto ခွဲပေးမယ်)\n"
-        "3️⃣ `/tts` - စာသားကို Voiceover (အသံဖိုင်) ပြောင်းပေးမယ် (စာရှည်ရင် Auto ခွဲပေးမယ်)\n"
-        "4️⃣ `/recap` - Video ကနေ ဇာတ်လမ်းအနှစ်ချုပ် ထုတ်ပေးမယ်\n\n"
+        "2️⃣ `/translate` - SRT ဖိုင် ဘာသာပြန်ပေးမယ်\n"
+        "3️⃣ `/tts` - စာသားကို Voiceover (အသံဖိုင်) ပြောင်းပေးမယ်\n"
+        "4️⃣ `/tts_thiha` - အမျိုးသားအသံ (Thiha) နဲ့ Voiceover လုပ်မယ်\n"
+        "5️⃣ `/tts_nilar` - အမျိုးသမီးအသံ (Nilar) နဲ့ Voiceover လုပ်မယ်\n"
+        "6️⃣ `/recap` - Video ကနေ ဇာတ်လမ်းအနှစ်ချုပ် ထုတ်ပေးမယ်\n\n"
         "💡 သုံးနည်း: Command ကိုနှိပ်ပြီး ဖိုင်/စာသား ပို့ပါ။",
         parse_mode='Markdown')
 
@@ -254,7 +243,6 @@ def process_transcribe(message):
             bot.reply_to(message, "❌ Audio/Video ဖိုင် တစ်ခုခု ပို့ပါ။")
             return
         
-        # ဖိုင်ကို ဆွဲချမယ်
         if message.audio:
             file_info = message.audio
             ext = "mp3"
@@ -274,11 +262,9 @@ def process_transcribe(message):
         
         status = bot.reply_to(message, "⏳ Transcription လုပ်နေပါပြီ... (ဗီဒီယိုရှည်ရင် ၁-၂ မိနစ်ကြာနိုင်ပါတယ်)")
         
-        # Groq API ကို ခေါ်မယ်
         srt_content = transcribe_with_groq(temp_file)
-        os.remove(temp_file)  # ယာယီဖိုင်ကို ဖျက်မယ်
+        os.remove(temp_file)
         
-        # SRT ဖိုင် ပြန်ပို့မယ်
         srt_file = io.BytesIO(srt_content.encode('utf-8'))
         srt_file.name = f"transcript_{message.from_user.id}.srt"
         bot.send_document(message.chat.id, srt_file, caption="✅ ဒီမှာ သင့် SRT Transcript ပါ။")
@@ -306,10 +292,8 @@ def process_translate(message):
         
         status = bot.reply_to(message, "⏳ ဘာသာပြန်နေပါပြီ... (စာလုံးရေများရင် ခဏစောင့်ပါ)")
         
-        # SRT ဖိုင်ကို ဘာသာပြန်မယ်
         translated_srt = translate_srt_full(srt_content)
         
-        # ဘာသာပြန်ပြီးသား SRT ကို ပြန်ပို့မယ်
         srt_file = io.BytesIO(translated_srt.encode('utf-8'))
         srt_file.name = f"translated_{message.from_user.id}.srt"
         bot.send_document(message.chat.id, srt_file, caption="✅ ဒီမှာ ဘာသာပြန်ပြီးသား SRT ဖိုင်ပါ။ (မြန်မာလို)")
@@ -318,27 +302,40 @@ def process_translate(message):
     except Exception as e:
         bot.reply_to(message, f"❌ အမှားဖြစ်သွားတယ်: {str(e)}")
 
-# /tts
+# /tts (Default - Nilar)
 @bot.message_handler(commands=['tts'])
 def tts_command(message):
-    bot.reply_to(message, "🔊 Voiceover လုပ်ချင်တဲ့ စာသားကို ရိုက်ထည့်ပါ။ (စာရှည်ရင် Auto ခွဲပြီး ပေါင်းပေးမယ်)")
-    bot.register_next_step_handler(message, process_tts)
+    bot.reply_to(message, "🔊 Voiceover လုပ်ချင်တဲ့ စာသားကို ရိုက်ထည့်ပါ။ (မူရင်းအသံ - Nilar - အမျိုးသမီး)")
+    bot.register_next_step_handler(message, lambda m: process_tts(m, 'my-MM-NilarNeural'))
 
-def process_tts(message):
+# /tts_thiha (အမျိုးသားအသံ)
+@bot.message_handler(commands=['tts_thiha'])
+def tts_thiha_command(message):
+    bot.reply_to(message, "🔊 Voiceover လုပ်ချင်တဲ့ စာသားကို ရိုက်ထည့်ပါ။ (အမျိုးသားအသံ - Thiha)")
+    bot.register_next_step_handler(message, lambda m: process_tts(m, 'my-MM-ThihaNeural'))
+
+# /tts_nilar (အမျိုးသမီးအသံ)
+@bot.message_handler(commands=['tts_nilar'])
+def tts_nilar_command(message):
+    bot.reply_to(message, "🔊 Voiceover လုပ်ချင်တဲ့ စာသားကို ရိုက်ထည့်ပါ။ (အမျိုးသမီးအသံ - Nilar)")
+    bot.register_next_step_handler(message, lambda m: process_tts(m, 'my-MM-NilarNeural'))
+
+def process_tts(message, voice_name):
     try:
         text = message.text
         if not text:
             bot.reply_to(message, "❌ စာသားတစ်ခုခု ရိုက်ထည့်ပါ။")
             return
         
-        status = bot.reply_to(message, "⏳ Voiceover ဖန်တီးနေပါပြီ... (စာရှည်ရင် ၁-၂ မိနစ်ကြာနိုင်ပါတယ်)")
+        # အသံအမည်ကို လှပအောင် ပြန်ပြင်မယ်
+        voice_display = "Nilar (အမျိုးသမီး)" if "Nilar" in voice_name else "Thiha (အမျိုးသား)"
+        status = bot.reply_to(message, f"⏳ Voiceover ဖန်တီးနေပါပြီ... (အသံ: {voice_display}) (စာရှည်ရင် ၁-၂ မိနစ်ကြာနိုင်ပါတယ်)")
         
-        # စာသားရှည်ရင် Auto ခွဲပြီး TTS လုပ်မယ်
-        combined_audio = generate_voiceover_full(text)
+        combined_audio = generate_voiceover_full(text, voice_name)
         
         audio_file = io.BytesIO(combined_audio)
         audio_file.name = f"voiceover_{message.from_user.id}.mp3"
-        bot.send_audio(message.chat.id, audio_file, caption="✅ ဒီမှာ သင့် Voiceover အပြီးသတ်ဖိုင်ပါ။")
+        bot.send_audio(message.chat.id, audio_file, caption=f"✅ ဒီမှာ သင့် Voiceover ဖိုင်ပါ။ (အသံ: {voice_display})")
         bot.delete_message(message.chat.id, status.message_id)
         
     except Exception as e:
@@ -369,11 +366,9 @@ def process_recap(message):
         
         status = bot.reply_to(message, "⏳ Video ကို ခွဲခြမ်းစိတ်ဖြာနေပါပြီ... (၂-၃ မိနစ်လောက်ကြာနိုင်ပါတယ်)")
         
-        # ၁။ Groq နဲ့ Transcript ထုတ်မယ်
         transcript = transcribe_with_groq(temp_file)
         os.remove(temp_file)
         
-        # ၂။ Gemini နဲ့ ဇာတ်လမ်းအနှစ်ချုပ် ထုတ်မယ်
         import google.generativeai as genai
         genai.configure(api_key=GEMINI_API_KEY)
         model = genai.GenerativeModel('gemini-1.5-flash')
