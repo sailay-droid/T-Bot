@@ -1,22 +1,221 @@
 import os
+import io
+import time
+import re
+import requests
 import telebot
 from flask import Flask, request
+from telebot.types import InputFile
 
-# === Render ရဲ့ Environment Variable ကနေ Token ကို ယူမယ် (အောက်မှာ ရှင်းပြမယ်) ===
+# ============================================
+# ၁။ Environment Variables များကို ဖတ်ယူခြင်း
+# ============================================
 BOT_TOKEN = os.environ.get('BOT_TOKEN')
+GROQ_API_KEY = os.environ.get('GROQ_API_KEY')
+GEMINI_API_KEY = os.environ.get('GEMINI_API_KEY')
+FISH_API_KEY = os.environ.get('FISH_API_KEY')
+RENDER_URL = os.environ.get('RENDER_EXTERNAL_URL', '')
+
+# API Key မပါရင် Error ထုတ်မယ်
 if not BOT_TOKEN:
     raise ValueError("BOT_TOKEN environment variable not set!")
+if not GROQ_API_KEY:
+    raise ValueError("GROQ_API_KEY environment variable not set!")
+if not GEMINI_API_KEY:
+    raise ValueError("GEMINI_API_KEY environment variable not set!")
 
+# ============================================
+# ၂။ Flask & Bot Setup
+# ============================================
 bot = telebot.TeleBot(BOT_TOKEN)
 app = Flask(__name__)
 
-# === Flask Web Server ရဲ့ Health Check Route (Render အတွက် လိုအပ်) ===
+# ယာယီဖိုင်သိမ်းမယ့် နေရာ (Render အတွက် /tmp က အကောင်းဆုံး)
+TEMP_FOLDER = "/tmp/"
+if not os.path.exists(TEMP_FOLDER):
+    os.makedirs(TEMP_FOLDER)
+
+# ============================================
+# ၃။ Helper Functions (အကူအညီပေးမယ့် Function များ)
+# ============================================
+
+# ၃.၁ စာသားကို အပိုင်းလိုက်ခွဲပေးမယ့် Function
+def split_text_into_chunks(text, max_chars=3000):
+    """စာသားရှည်ကြီးကို ဝါကျအတိုင်း ခွဲပေးမယ်"""
+    if len(text) <= max_chars:
+        return [text]
+    
+    chunks = []
+    sentences = re.split(r'(?<=[.!?])\s+', text)
+    current_chunk = []
+    current_len = 0
+    
+    for sentence in sentences:
+        sentence_len = len(sentence) + 1
+        if current_len + sentence_len > max_chars and current_chunk:
+            chunks.append(' '.join(current_chunk))
+            current_chunk = [sentence]
+            current_len = sentence_len
+        else:
+            current_chunk.append(sentence)
+            current_len += sentence_len
+    
+    if current_chunk:
+        chunks.append(' '.join(current_chunk))
+    
+    return chunks
+
+# ၃.၂ Transcription (SRT) - Groq Whisper API
+def transcribe_with_groq(file_path):
+    """Groq Whisper API ကိုသုံးပြီး SRT ထုတ်ပေးမယ်"""
+    url = "https://api.groq.com/openai/v1/audio/transcriptions"
+    headers = {"Authorization": f"Bearer {GROQ_API_KEY}"}
+    
+    # ဖိုင်အမျိုးအစားကို ခွဲခြားသတ်မှတ်မယ်
+    filename = os.path.basename(file_path)
+    if filename.endswith('.mp4') or filename.endswith('.avi') or filename.endswith('.mov'):
+        mime_type = 'video/mp4'
+    else:
+        mime_type = 'audio/mp3'
+    
+    with open(file_path, 'rb') as f:
+        files = {'file': (filename, f, mime_type)}
+        data = {'model': 'whisper-large-v3', 'response_format': 'srt'}
+        response = requests.post(url, headers=headers, files=files, data=data, timeout=120)
+    
+    if response.status_code == 200:
+        return response.text
+    else:
+        raise Exception(f"Groq API Error: {response.status_code} - {response.text}")
+
+# ၃.၃ Translation - Gemini (Primary) + LibreTranslate (Fallback)
+def translate_with_gemini(text):
+    """Gemini API ကိုသုံးပြီး မြန်မာလို ဘာသာပြန်မယ်"""
+    import google.generativeai as genai
+    genai.configure(api_key=GEMINI_API_KEY)
+    
+    model = genai.GenerativeModel(
+        model_name="gemini-1.5-flash",
+        system_instruction="You are a professional translator. Translate the following English text into natural, fluent Burmese (Myanmar). Use everyday language and maintain the original tone and meaning. Only return the translated text."
+    )
+    response = model.generate_content(text)
+    return response.text
+
+def translate_with_libretranslate(text):
+    """LibreTranslate (အခမဲ့ Public API) ကို Fallback အနေနဲ့ သုံးမယ်"""
+    url = "https://libretranslate.com/translate"
+    payload = {
+        "q": text,
+        "source": "en",
+        "target": "my",
+        "format": "text"
+    }
+    response = requests.post(url, json=payload, timeout=30)
+    if response.status_code == 200:
+        return response.json()["translatedText"]
+    else:
+        raise Exception(f"LibreTranslate Error: {response.status_code}")
+
+def translate_text_with_fallback(text):
+    """Gemini ကို အရင်ခေါ်ပြီး မရရင် LibreTranslate ကို ပြောင်းသုံးမယ်"""
+    try:
+        return translate_with_gemini(text)
+    except Exception as e:
+        print(f"⚠️ Gemini failed: {e}. Falling back to LibreTranslate...")
+        return translate_with_libretranslate(text)
+
+# ၃.၄ Text-to-Speech - Fish Audio (Primary) + gTTS (Fallback)
+def tts_with_fish(text):
+    """Fish Audio API ကိုသုံးပြီး အသံဖိုင် (MP3 Bytes) ပြန်ပေးမယ်"""
+    url = "https://api.fish.audio/v1/tts"
+    headers = {
+        "Authorization": f"Bearer {FISH_API_KEY}",
+        "Content-Type": "application/json"
+    }
+    data = {
+        "text": text,
+        "model": "S2.1Pro",
+        "language": "my"  # မြန်မာလိုရနိုင်ရင်
+    }
+    response = requests.post(url, json=data, headers=headers, timeout=60)
+    if response.status_code == 200:
+        return response.content
+    else:
+        raise Exception(f"Fish API Error: {response.status_code}")
+
+def tts_with_gtts(text):
+    """gTTS (အင်္ဂလိပ်လိုပဲ) ကို Fallback အနေနဲ့ သုံးမယ်"""
+    from gtts import gTTS
+    tts = gTTS(text[:1000], lang='en', slow=False)
+    audio_bytes = io.BytesIO()
+    tts.write_to_fp(audio_bytes)
+    audio_bytes.seek(0)
+    return audio_bytes.read()
+
+def generate_voiceover_full(text):
+    """စာသားရှည်ကြီးကို အပိုင်းလိုက်ခွဲပြီး TTS ခေါ်ကာ အားလုံးပေါင်းပေးမယ်"""
+    chunks = split_text_into_chunks(text, max_chars=3000)
+    total = len(chunks)
+    combined_audio = b''
+    
+    for i, chunk in enumerate(chunks):
+        print(f"🔊 TTS: {i+1}/{total}")
+        try:
+            audio_bytes = tts_with_fish(chunk)
+        except Exception as e:
+            print(f"⚠️ Fish TTS failed: {e}. Falling back to gTTS...")
+            audio_bytes = tts_with_gtts(chunk)
+        
+        combined_audio += audio_bytes
+        time.sleep(1)  # Rate Limit အတွက်
+    
+    return combined_audio
+
+# ၃.၅ SRT ဖိုင် တစ်ခုလုံးကို ဘာသာပြန်ပေးမယ့် Function
+def translate_srt_full(srt_content):
+    """SRT ဖိုင်ထဲက စာသားတွေကို ဘာသာပြန်ပြီး SRT ပုံစံအတိုင်း ပြန်ထုတ်ပေးမယ်"""
+    lines = srt_content.split('\n')
+    
+    # စာသားတွေကို စုမယ်
+    text_parts = []
+    text_indices = []
+    for i, line in enumerate(lines):
+        # နံပါတ်၊ Timestamp မဟုတ်တဲ့ စာကြောင်းတွေကို ရွေးမယ်
+        if line.strip() and not line.strip().isdigit() and '-->' not in line:
+            text_parts.append(line.strip())
+            text_indices.append(i)
+    
+    full_text = '\n'.join(text_parts)
+    
+    # စာသားရှည်ရင် အပိုင်းလိုက်ခွဲပြီး ဘာသာပြန်မယ်
+    if len(full_text) > 4000:
+        chunks = split_text_into_chunks(full_text, max_chars=4000)
+        translated_parts = []
+        for chunk in chunks:
+            translated = translate_text_with_fallback(chunk)
+            translated_parts.append(translated)
+            time.sleep(0.5)  # Rate Limit အတွက်
+        translated_text = ' '.join(translated_parts)
+    else:
+        translated_text = translate_text_with_fallback(full_text)
+    
+    # ဘာသာပြန်ပြီးသား စာသားကို မူလနေရာတွေမှာ အစားထိုးမယ်
+    translated_lines = translated_text.split('\n')
+    result_lines = lines.copy()
+    for idx, pos in enumerate(text_indices):
+        if idx < len(translated_lines):
+            result_lines[pos] = translated_lines[idx]
+    
+    return '\n'.join(result_lines)
+
+# ============================================
+# ၄။ Flask Routes (Render အတွက်)
+# ============================================
 @app.route('/')
 @app.route('/health')
 def health_check():
-    return "Bot is running!", 200
+    return "✅ Bot is running!", 200
 
-# === Webhook Route (Telegram က မက်ဆေ့ချ်တွေ ဒီကိုပဲ ပို့မယ်) ===
 @app.route('/webhook', methods=['POST'])
 def webhook():
     if request.headers.get('content-type') == 'application/json':
@@ -24,33 +223,186 @@ def webhook():
         update = telebot.types.Update.de_json(json_string)
         bot.process_new_updates([update])
         return 'OK', 200
-    else:
-        return 'Unsupported content type', 400
+    return 'Unsupported content type', 400
 
-# === Bot ရဲ့ Command Handler တွေ (အရင်က ရေးထားတဲ့အတိုင်း) ===
+# ============================================
+# ၅။ Telegram Bot Handlers
+# ============================================
+
+# /start
 @bot.message_handler(commands=['start'])
 def send_welcome(message):
-    bot.reply_to(message, "မင်္ဂလာပါ! ငါအခု Cloud ပေါ်မှာ ၂၄ နာရီ အလုပ်လုပ်နေပါပြီ။")
+    bot.reply_to(message,
+        "🎬 **MyRCBot - Movie Recap Assistant**\n\n"
+        "📌 **Command များ:**\n"
+        "1️⃣ `/transcribe` - Video/Audio ကနေ SRT Transcript ထုတ်ပေးမယ်\n"
+        "2️⃣ `/translate` - SRT ဖိုင် ဘာသာပြန်ပေးမယ် (စာရှည်ရင် Auto ခွဲပေးမယ်)\n"
+        "3️⃣ `/tts` - စာသားကို Voiceover (အသံဖိုင်) ပြောင်းပေးမယ် (စာရှည်ရင် Auto ခွဲပေးမယ်)\n"
+        "4️⃣ `/recap` - Video ကနေ ဇာတ်လမ်းအနှစ်ချုပ် ထုတ်ပေးမယ်\n\n"
+        "💡 သုံးနည်း: Command ကိုနှိပ်ပြီး ဖိုင်/စာသား ပို့ပါ။",
+        parse_mode='Markdown')
 
-@bot.message_handler(func=lambda message: True)
-def echo_all(message):
-    bot.reply_to(message, f"မင်းပြောတာက: {message.text}")
+# /transcribe
+@bot.message_handler(commands=['transcribe'])
+def transcribe_command(message):
+    bot.reply_to(message, "🎤 Video/Audio ဖိုင် (MP4, MP3) ကို ပို့ပါ။ (Groq API အခမဲ့)")
+    bot.register_next_step_handler(message, process_transcribe)
 
-# === Webhook ကို သတ်မှတ်တဲ့အပိုင်း (Render ရဲ့ URL ကို သုံးမယ်) ===
-# Render က Service ကို အလိုအလျောက် Public URL ပေးတယ်
-# ဒီ URL ကို အောက်က နေရာမှာ သုံးမယ်
-WEBHOOK_URL = os.environ.get('RENDER_EXTERNAL_URL', '') + '/webhook'
+def process_transcribe(message):
+    try:
+        if not message.audio and not message.video and not message.document:
+            bot.reply_to(message, "❌ Audio/Video ဖိုင် တစ်ခုခု ပို့ပါ။")
+            return
+        
+        # ဖိုင်ကို ဆွဲချမယ်
+        if message.audio:
+            file_info = message.audio
+            ext = "mp3"
+        elif message.video:
+            file_info = message.video
+            ext = "mp4"
+        else:
+            file_info = message.document
+            ext = message.document.file_name.split('.')[-1] if message.document.file_name else "bin"
+        
+        file_path = bot.get_file(file_info.file_id)
+        downloaded_file = bot.download_file(file_path.file_path)
+        
+        temp_file = os.path.join(TEMP_FOLDER, f"audio_{message.from_user.id}_{int(time.time())}.{ext}")
+        with open(temp_file, 'wb') as f:
+            f.write(downloaded_file)
+        
+        status = bot.reply_to(message, "⏳ Transcription လုပ်နေပါပြီ... (ဗီဒီယိုရှည်ရင် ၁-၂ မိနစ်ကြာနိုင်ပါတယ်)")
+        
+        # Groq API ကို ခေါ်မယ်
+        srt_content = transcribe_with_groq(temp_file)
+        os.remove(temp_file)  # ယာယီဖိုင်ကို ဖျက်မယ်
+        
+        # SRT ဖိုင် ပြန်ပို့မယ်
+        srt_file = io.BytesIO(srt_content.encode('utf-8'))
+        srt_file.name = f"transcript_{message.from_user.id}.srt"
+        bot.send_document(message.chat.id, srt_file, caption="✅ ဒီမှာ သင့် SRT Transcript ပါ။")
+        bot.delete_message(message.chat.id, status.message_id)
+        
+    except Exception as e:
+        bot.reply_to(message, f"❌ အမှားဖြစ်သွားတယ်: {str(e)}")
 
+# /translate
+@bot.message_handler(commands=['translate'])
+def translate_command(message):
+    bot.reply_to(message, "🌍 SRT ဖိုင် (.srt) ကို ပို့ပါ။ (စာရှည်ရင် Auto ခွဲပြီး ဘာသာပြန်ပေးမယ်)")
+    bot.register_next_step_handler(message, process_translate)
+
+def process_translate(message):
+    try:
+        if not message.document or not message.document.file_name.endswith('.srt'):
+            bot.reply_to(message, "❌ .srt ဖိုင် တစ်ခု ပို့ပါ။")
+            return
+        
+        file_info = message.document
+        file_path = bot.get_file(file_info.file_id)
+        downloaded_file = bot.download_file(file_path.file_path)
+        srt_content = downloaded_file.decode('utf-8')
+        
+        status = bot.reply_to(message, "⏳ ဘာသာပြန်နေပါပြီ... (စာလုံးရေများရင် ခဏစောင့်ပါ)")
+        
+        # SRT ဖိုင်ကို ဘာသာပြန်မယ်
+        translated_srt = translate_srt_full(srt_content)
+        
+        # ဘာသာပြန်ပြီးသား SRT ကို ပြန်ပို့မယ်
+        srt_file = io.BytesIO(translated_srt.encode('utf-8'))
+        srt_file.name = f"translated_{message.from_user.id}.srt"
+        bot.send_document(message.chat.id, srt_file, caption="✅ ဒီမှာ ဘာသာပြန်ပြီးသား SRT ဖိုင်ပါ။ (မြန်မာလို)")
+        bot.delete_message(message.chat.id, status.message_id)
+        
+    except Exception as e:
+        bot.reply_to(message, f"❌ အမှားဖြစ်သွားတယ်: {str(e)}")
+
+# /tts
+@bot.message_handler(commands=['tts'])
+def tts_command(message):
+    bot.reply_to(message, "🔊 Voiceover လုပ်ချင်တဲ့ စာသားကို ရိုက်ထည့်ပါ။ (စာရှည်ရင် Auto ခွဲပြီး ပေါင်းပေးမယ်)")
+    bot.register_next_step_handler(message, process_tts)
+
+def process_tts(message):
+    try:
+        text = message.text
+        if not text:
+            bot.reply_to(message, "❌ စာသားတစ်ခုခု ရိုက်ထည့်ပါ။")
+            return
+        
+        status = bot.reply_to(message, "⏳ Voiceover ဖန်တီးနေပါပြီ... (စာရှည်ရင် ၁-၂ မိနစ်ကြာနိုင်ပါတယ်)")
+        
+        # စာသားရှည်ရင် Auto ခွဲပြီး TTS လုပ်မယ်
+        combined_audio = generate_voiceover_full(text)
+        
+        audio_file = io.BytesIO(combined_audio)
+        audio_file.name = f"voiceover_{message.from_user.id}.mp3"
+        bot.send_audio(message.chat.id, audio_file, caption="✅ ဒီမှာ သင့် Voiceover အပြီးသတ်ဖိုင်ပါ။")
+        bot.delete_message(message.chat.id, status.message_id)
+        
+    except Exception as e:
+        bot.reply_to(message, f"❌ အမှားဖြစ်သွားတယ်: {str(e)}")
+
+# /recap
+@bot.message_handler(commands=['recap'])
+def recap_command(message):
+    bot.reply_to(message, "🎬 Recap လုပ်ချင်တဲ့ Video ဖိုင် (MP4) ကို ပို့ပါ။")
+    bot.register_next_step_handler(message, process_recap)
+
+def process_recap(message):
+    try:
+        if not message.video and not message.document:
+            bot.reply_to(message, "❌ Video ဖိုင် တစ်ခု ပို့ပါ။")
+            return
+        
+        if message.video:
+            file_info = message.video
+        else:
+            file_info = message.document
+        
+        file_path = bot.get_file(file_info.file_id)
+        downloaded_file = bot.download_file(file_path.file_path)
+        temp_file = os.path.join(TEMP_FOLDER, f"video_{message.from_user.id}_{int(time.time())}.mp4")
+        with open(temp_file, 'wb') as f:
+            f.write(downloaded_file)
+        
+        status = bot.reply_to(message, "⏳ Video ကို ခွဲခြမ်းစိတ်ဖြာနေပါပြီ... (၂-၃ မိနစ်လောက်ကြာနိုင်ပါတယ်)")
+        
+        # ၁။ Groq နဲ့ Transcript ထုတ်မယ်
+        transcript = transcribe_with_groq(temp_file)
+        os.remove(temp_file)
+        
+        # ၂။ Gemini နဲ့ ဇာတ်လမ်းအနှစ်ချုပ် ထုတ်မယ်
+        import google.generativeai as genai
+        genai.configure(api_key=GEMINI_API_KEY)
+        model = genai.GenerativeModel('gemini-1.5-flash')
+        prompt = f"""အောက်ပါ Video Transcript ကိုဖတ်ပြီး ရုပ်ရှင်ဇာတ်လမ်းအနှစ်ချုပ် (Movie Recap) ပုံစံနဲ့ မြန်မာလို ရေးပါ။ 
+        ဇာတ်လမ်းအကျဉ်း၊ အဓိကဇာတ်ကောင်တွေ၊ ဇာတ်လမ်းအဆုံးသတ်ကို ထည့်သွင်းပါ။
+
+        Transcript:
+        {transcript[:5000]}"""
+        response = model.generate_content(prompt)
+        recap = response.text
+        
+        bot.reply_to(message, f"🎬 **Movie Recap**\n\n{recap}", parse_mode='Markdown')
+        bot.send_document(message.chat.id, io.BytesIO(recap.encode('utf-8')), visible_file_name="recap.txt", caption="📄 ဒီမှာ Recap စာသားဖိုင်ပါ။")
+        bot.delete_message(message.chat.id, status.message_id)
+        
+    except Exception as e:
+        bot.reply_to(message, f"❌ အမှားဖြစ်သွားတယ်: {str(e)}")
+
+# ============================================
+# ၆။ Main Entry Point
+# ============================================
 if __name__ == '__main__':
-    # Webhook ကို စနစ်ထည့်မယ်
-    if WEBHOOK_URL and WEBHOOK_URL.startswith('http'):
+    webhook_url = RENDER_URL + '/webhook' if RENDER_URL else ''
+    if webhook_url and webhook_url.startswith('http'):
         bot.remove_webhook()
-        bot.set_webhook(url=WEBHOOK_URL)
-        print(f"Webhook set to: {WEBHOOK_URL}")
+        bot.set_webhook(url=webhook_url)
+        print(f"✅ Webhook set to: {webhook_url}")
     else:
-        print("Warning: RENDER_EXTERNAL_URL not set, using polling mode (not recommended for Render).")
-        # Render မှာ Polling သုံးရင် Conflict ဖြစ်နိုင်လို့ Webhook က အကောင်းဆုံးပါ[reference:9]
+        print("⚠️ RENDER_EXTERNAL_URL not set, using polling mode.")
     
-    # Flask Server ကို စတင်မယ် (Render ရဲ့ PORT ကို သုံးမယ်)[reference:10]
     port = int(os.environ.get('PORT', 5000))
     app.run(host='0.0.0.0', port=port)
