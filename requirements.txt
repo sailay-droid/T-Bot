@@ -3,3 +3,5 @@ pyTelegramBotAPI==4.18.0
 gunicorn==22.0.0
 requests==2.31.0
 google-generativeai==0.3.2
+edge-tts==6.1.9
+gTTS==2.4.0
