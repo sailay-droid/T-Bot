@@ -251,9 +251,10 @@ def process_translate(message):
         # SRT ဖိုင်ကို ဘာသာပြန်မယ်
         translated_srt = translate_srt_full(srt_content)
         
-        # === အရေးကြီး: SRT ဖိုင်ကို Document အဖြစ် ပြန်ပို့မယ် ===
+        # === အရေးကြီး: BytesIO ကို မှန်ကန်စွာ ပြင်ဆင်မယ် ===
         srt_bytes = translated_srt.encode('utf-8')
         srt_file = io.BytesIO(srt_bytes)
+        srt_file.seek(0)  # ဒါက အရေးကြီးပါတယ်။ ဖိုင်ရဲ့အစကို ညွှန်ပါတယ်။
         srt_file.name = f"translated_{message.from_user.id}.srt"
         
         # Document ကို ပို့မယ်
