@@ -4,6 +4,8 @@ import time
 import re
 import requests
 import telebot
+import asyncio
+import edge_tts
 from flask import Flask, request
 
 # ============================================
@@ -22,9 +24,8 @@ if not GEMINI_API_KEY:
     raise ValueError("GEMINI_API_KEY environment variable not set!")
 
 # ============================================
-# ၂။ Flask & Bot Setup
+# ၂။ Flask & Bot Setup (Webhook အတွက် threaded=False ထည့်ပါ)
 # ============================================
-# ဒီလိုပြင်ပါ
 bot = telebot.TeleBot(BOT_TOKEN, threaded=False)
 app = Flask(__name__)
 
@@ -73,38 +74,54 @@ def transcribe_with_groq(file_path):
     else:
         raise Exception(f"Groq API Error: {response.status_code} - {response.text}")
 
+# ============================================
+# ၃.၁ Translation - Gemini REST API (ဖြေရှင်းနည်း ၃)
+# ============================================
 def translate_with_gemini(text):
-    import google.generativeai as genai
-    genai.configure(api_key=GEMINI_API_KEY)
-    model = genai.GenerativeModel(
-        model_name="gemini-1.5-flash",
-        system_instruction="You are a professional translator. Translate the following English text into natural, fluent Burmese (Myanmar). Use everyday language and maintain the original tone and meaning. Only return the translated text."
-    )
-    response = model.generate_content(text)
-    return response.text
+    """Gemini REST API ကို တိုက်ရိုက်ခေါ်ပြီး မြန်မာလို ဘာသာပြန်မယ်"""
+    url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent"
+    headers = {
+        "Content-Type": "application/json"
+    }
+    params = {
+        "key": GEMINI_API_KEY
+    }
+    
+    # System Instruction ကို Prompt ထဲမှာ တိုက်ရိုက်ထည့်မယ်
+    prompt = f"""You are a professional translator. Translate the following English text into natural, fluent Burmese (Myanmar). Use everyday language and maintain the original tone and meaning. Only return the translated text.
 
-def translate_with_libretranslate(text):
-    url = "https://libretranslate.com/translate"
-    payload = {"q": text, "source": "en", "target": "my", "format": "text"}
-    response = requests.post(url, json=payload, timeout=30)
+Text to translate:
+{text}"""
+    
+    data = {
+        "contents": [{
+            "parts": [{"text": prompt}]
+        }]
+    }
+    
+    response = requests.post(url, headers=headers, params=params, json=data, timeout=60)
+    
     if response.status_code == 200:
-        return response.json()["translatedText"]
+        result = response.json()
+        try:
+            return result["candidates"][0]["content"]["parts"][0]["text"]
+        except (KeyError, IndexError):
+            raise Exception(f"Unexpected API response: {result}")
     else:
-        raise Exception(f"LibreTranslate Error: {response.status_code}")
+        raise Exception(f"Gemini API Error: {response.status_code} - {response.text}")
 
 def translate_text_with_fallback(text):
-    """Gemini API ကိုပဲ သုံးပြီး မြန်မာလို ဘာသာပြန်မယ်"""
+    """Gemini ကိုပဲ သုံးမယ် (LibreTranslate မသုံးတော့ဘူး)"""
     try:
         return translate_with_gemini(text)
     except Exception as e:
-        print(f"⚠️ Gemini translation failed: {e}")
-        # ဘာသာပြန်မရရင် မူရင်းစာသားကို ပြန်ပေးမယ်
-        return f"[Translation failed] {text[:200]}..."
+        print(f"⚠️ Gemini failed: {e}")
+        # Error ဖြစ်ရင် မူရင်းစာသားကို ပြန်ပေးမယ်
+        return f"[Translation Error] {text[:200]}..."
 
-# Edge TTS
-import asyncio
-import edge_tts
-
+# ============================================
+# ၃.၂ Text-to-Speech - Edge TTS
+# ============================================
 async def tts_with_edge(text, voice="my-MM-NilarNeural"):
     communicate = edge_tts.Communicate(text, voice)
     audio_data = b""
@@ -137,6 +154,9 @@ def generate_voiceover_full(text, voice_name="my-MM-NilarNeural"):
         time.sleep(0.5)
     return combined_audio
 
+# ============================================
+# ၃.၃ SRT ဖိုင် ဘာသာပြန်ခြင်း
+# ============================================
 def translate_srt_full(srt_content):
     lines = srt_content.split('\n')
     text_parts = []
@@ -146,16 +166,18 @@ def translate_srt_full(srt_content):
             text_parts.append(line.strip())
             text_indices.append(i)
     full_text = '\n'.join(text_parts)
+    
     if len(full_text) > 4000:
         chunks = split_text_into_chunks(full_text, max_chars=4000)
         translated_parts = []
         for chunk in chunks:
             translated = translate_text_with_fallback(chunk)
             translated_parts.append(translated)
-            time.sleep(0.5)
+            time.sleep(0.5)  # Rate Limit အတွက်
         translated_text = ' '.join(translated_parts)
     else:
         translated_text = translate_text_with_fallback(full_text)
+    
     translated_lines = translated_text.split('\n')
     result_lines = lines.copy()
     for idx, pos in enumerate(text_indices):
@@ -164,7 +186,7 @@ def translate_srt_full(srt_content):
     return '\n'.join(result_lines)
 
 # ============================================
-# ၄။ Flask Routes
+# ၄။ Flask Routes (Webhook)
 # ============================================
 @app.route('/')
 @app.route('/health')
@@ -190,7 +212,7 @@ def send_welcome(message):
         "🎬 **MyRCBot - Movie Recap Assistant**\n\n"
         "📌 **Command များ:**\n"
         "1️⃣ `/transcribe` - Video/Audio ကနေ SRT Transcript ထုတ်ပေးမယ်\n"
-        "2️⃣ `/translate` - SRT ဖိုင် ဘာသာပြန်ပေးမယ်\n"
+        "2️⃣ `/translate` - SRT ဖိုင် မြန်မာလို ဘာသာပြန်ပေးမယ်\n"
         "3️⃣ `/tts` - စာသားကို Voiceover (Nilar) ပြောင်းပေးမယ်\n"
         "4️⃣ `/tts_nilar` - Nilar (အမျိုးသမီး) အသံနဲ့ Voiceover\n"
         "5️⃣ `/tts_thiha` - Thiha (အမျိုးသား) အသံနဲ့ Voiceover\n"
@@ -234,7 +256,7 @@ def process_transcribe(message):
 
 @bot.message_handler(commands=['translate'])
 def translate_command(message):
-    bot.reply_to(message, "🌍 SRT ဖိုင် (.srt) ကို ပို့ပါ။")
+    bot.reply_to(message, "🌍 SRT ဖိုင် (.srt) ကို ပို့ပါ။ (Gemini API နဲ့ မြန်မာလို ဘာသာပြန်ပေးမယ်)")
     bot.register_next_step_handler(message, process_translate)
 
 def process_translate(message):
@@ -242,37 +264,62 @@ def process_translate(message):
         if not message.document or not message.document.file_name.endswith('.srt'):
             bot.reply_to(message, "❌ .srt ဖိုင် တစ်ခု ပို့ပါ။")
             return
-        
         file_info = message.document
         file_path = bot.get_file(file_info.file_id)
         downloaded_file = bot.download_file(file_path.file_path)
         srt_content = downloaded_file.decode('utf-8')
         
-        status = bot.reply_to(message, "⏳ ဘာသာပြန်နေပါပြီ...")
+        status = bot.reply_to(message, "⏳ ဘာသာပြန်နေပါပြီ... (Gemini API)")
         
         # SRT ဖိုင်ကို ဘာသာပြန်မယ်
         translated_srt = translate_srt_full(srt_content)
         
-        # === အရေးကြီး: BytesIO ကို မှန်ကန်စွာ ပြင်ဆင်မယ် ===
+        # Document ကို ပြန်ပို့မယ်
         srt_bytes = translated_srt.encode('utf-8')
         srt_file = io.BytesIO(srt_bytes)
-        srt_file.seek(0)  # ဒါက အရေးကြီးပါတယ်။ ဖိုင်ရဲ့အစကို ညွှန်ပါတယ်။
+        srt_file.seek(0)
         srt_file.name = f"translated_{message.from_user.id}.srt"
         
-        # Document ကို ပို့မယ်
         bot.send_document(
             message.chat.id,
             srt_file,
-            caption="✅ ဒီမှာ ဘာသာပြန်ပြီးသား SRT ဖိုင်ပါ။ (မြန်မာလို)"
+            caption="✅ ဒီမှာ ဘာသာပြန်ပြီးသား SRT ဖိုင်ပါ။ (မြန်မာလို - Gemini)"
         )
-        
-        # Status Message ကို ဖျက်မယ်
         bot.delete_message(message.chat.id, status.message_id)
-        
     except Exception as e:
-        # Error ဖြစ်ရင် User ကို ပြန်ပြောမယ်
         bot.reply_to(message, f"❌ အမှားဖြစ်သွားတယ်: {str(e)}")
-        
+
+@bot.message_handler(commands=['tts'])
+def tts_command(message):
+    bot.reply_to(message, "🔊 Voiceover လုပ်ချင်တဲ့ စာသားကို ရိုက်ထည့်ပါ။ (မူရင်းအသံ - Nilar)")
+    bot.register_next_step_handler(message, lambda m: process_tts(m, 'my-MM-NilarNeural'))
+
+@bot.message_handler(commands=['tts_nilar'])
+def tts_nilar_command(message):
+    bot.reply_to(message, "🔊 Voiceover လုပ်ချင်တဲ့ စာသားကို ရိုက်ထည့်ပါ။ (Nilar - အမျိုးသမီး)")
+    bot.register_next_step_handler(message, lambda m: process_tts(m, 'my-MM-NilarNeural'))
+
+@bot.message_handler(commands=['tts_thiha'])
+def tts_thiha_command(message):
+    bot.reply_to(message, "🔊 Voiceover လုပ်ချင်တဲ့ စာသားကို ရိုက်ထည့်ပါ။ (Thiha - အမျိုးသား)")
+    bot.register_next_step_handler(message, lambda m: process_tts(m, 'my-MM-ThihaNeural'))
+
+def process_tts(message, voice_name):
+    try:
+        text = message.text
+        if not text:
+            bot.reply_to(message, "❌ စာသားတစ်ခုခု ရိုက်ထည့်ပါ။")
+            return
+        voice_display = "Nilar (အမျိုးသမီး)" if "Nilar" in voice_name else "Thiha (အမျိုးသား)"
+        status = bot.reply_to(message, f"⏳ Voiceover ဖန်တီးနေပါပြီ... (Edge TTS - {voice_display})")
+        combined_audio = generate_voiceover_full(text, voice_name)
+        audio_file = io.BytesIO(combined_audio)
+        audio_file.name = f"voiceover_{message.from_user.id}.mp3"
+        bot.send_audio(message.chat.id, audio_file, caption=f"✅ ဒီမှာ သင့် Voiceover ဖိုင်ပါ။ (Edge TTS - {voice_display})")
+        bot.delete_message(message.chat.id, status.message_id)
+    except Exception as e:
+        bot.reply_to(message, f"❌ အမှားဖြစ်သွားတယ်: {str(e)}")
+
 @bot.message_handler(commands=['recap'])
 def recap_command(message):
     bot.reply_to(message, "🎬 Recap လုပ်ချင်တဲ့ Video ဖိုင် (MP4) ကို ပို့ပါ။")
@@ -295,14 +342,22 @@ def process_recap(message):
         status = bot.reply_to(message, "⏳ Video ကို ခွဲခြမ်းစိတ်ဖြာနေပါပြီ...")
         transcript = transcribe_with_groq(temp_file)
         os.remove(temp_file)
-        import google.generativeai as genai
-        genai.configure(api_key=GEMINI_API_KEY)
-        model = genai.GenerativeModel('gemini-1.5-flash')
+        
+        # Recap အတွက် Gemini REST API ကို သုံးမယ်
+        url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent"
+        params = {"key": GEMINI_API_KEY}
         prompt = f"""အောက်ပါ Video Transcript ကိုဖတ်ပြီး ရုပ်ရှင်ဇာတ်လမ်းအနှစ်ချုပ် (Movie Recap) ပုံစံနဲ့ မြန်မာလို ရေးပါ။ 
         ဇာတ်လမ်းအကျဉ်း၊ အဓိကဇာတ်ကောင်တွေ၊ ဇာတ်လမ်းအဆုံးသတ်ကို ထည့်သွင်းပါ။
         Transcript: {transcript[:5000]}"""
-        response = model.generate_content(prompt)
-        recap = response.text
+        data = {"contents": [{"parts": [{"text": prompt}]}]}
+        response = requests.post(url, headers={"Content-Type": "application/json"}, params=params, json=data, timeout=60)
+        
+        if response.status_code == 200:
+            result = response.json()
+            recap = result["candidates"][0]["content"]["parts"][0]["text"]
+        else:
+            recap = f"Recap generation failed: {response.status_code}"
+        
         bot.reply_to(message, f"🎬 **Movie Recap**\n\n{recap}", parse_mode='Markdown')
         bot.send_document(message.chat.id, io.BytesIO(recap.encode('utf-8')), visible_file_name="recap.txt", caption="📄 ဒီမှာ Recap စာသားဖိုင်ပါ။")
         bot.delete_message(message.chat.id, status.message_id)
@@ -323,8 +378,6 @@ else:
 # ============================================
 # ၇။ Main Entry Point (Flask)
 # ============================================
-# Gunicorn က app:app ကို ခေါ်တာမို့ __main__ က မပါတော့ဘူး
-# ဒါပေမယ့် python app.py နဲ့ စမ်းချင်ရင်လည်း ရအောင် ထည့်ထားတယ်
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
     app.run(host='0.0.0.0', port=port)
