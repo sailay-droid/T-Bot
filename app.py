@@ -101,43 +101,58 @@ Text to translate:
         raise Exception(f"Gemini API Error: {response.status_code} - {response.text}")
 
 def translate_text_with_fallback(text):
-    """Gemini ကိုပဲ သုံးမယ်"""
+    """Gemini ကိုပဲ သုံးမယ် (Error ဖြစ်ရင် မူရင်းစာသားကို ပြန်ပေးမယ်)"""
     try:
-        return translate_with_gemini(text)
+        result = translate_with_gemini(text)
+        # Gemini က တစ်ခါတလေ ဘာသာပြန်မရဘူးဆိုရင် မူရင်းစာသားကို ပြန်ပေးမယ်
+        if not result or len(result.strip()) < 5:
+            return text
+        return result
     except Exception as e:
         print(f"⚠️ Gemini failed: {e}")
-        return f"[Translation Error] {text[:200]}..."
-
+        return text  # မူရင်းစာသားကို ပြန်ပေးမယ်
 # ============================================
 # ၃.၂ SRT ဖိုင် ဘာသာပြန်ခြင်း
 # ============================================
 def translate_srt_full(srt_content):
+    """SRT ဖိုင်ကို လိုင်းလိုက်ခွဲပြီး အပိုင်းလိုက် ဘာသာပြန်မယ်"""
     lines = srt_content.split('\n')
-    text_parts = []
+    
+    # စာသားတွေကို စုမယ် (Timestamps နဲ့ နံပါတ်တွေကို ချန်ထားမယ်)
+    text_lines = []
     text_indices = []
     for i, line in enumerate(lines):
         if line.strip() and not line.strip().isdigit() and '-->' not in line:
-            text_parts.append(line.strip())
+            text_lines.append(line.strip())
             text_indices.append(i)
-    full_text = '\n'.join(text_parts)
     
-    # Gemini 3.6 Flash က Input များများ လက်ခံတာမို့ လိုအပ်ရင် အပိုင်းလိုက်ခွဲမယ်
-    if len(full_text) > 10000:
-        chunks = split_text_into_chunks(full_text, max_chars=8000)
-        translated_parts = []
-        for chunk in chunks:
-            translated = translate_text_with_fallback(chunk)
-            translated_parts.append(translated)
-            time.sleep(0.5)
-        translated_text = ' '.join(translated_parts)
-    else:
-        translated_text = translate_text_with_fallback(full_text)
+    # စာသားအားလုံးကို တစ်ခါတည်း မပေါင်းဘဲ အပိုင်းလိုက် ဘာသာပြန်မယ်
+    CHUNK_SIZE = 100  # စာကြောင်း ၁၀၀ စီ ခွဲမယ်
+    translated_parts = []
+    translated_indices = []
     
-    translated_lines = translated_text.split('\n')
+    for i in range(0, len(text_lines), CHUNK_SIZE):
+        chunk_lines = text_lines[i:i+CHUNK_SIZE]
+        chunk_text = '\n'.join(chunk_lines)
+        
+        # ဘာသာပြန်မယ်
+        translated = translate_text_with_fallback(chunk_text)
+        translated_parts.append(translated)
+        
+        # ဘာသာပြန်ပြီးသား စာကြောင်းတွေကို ခွဲမယ်
+        translated_lines = translated.split('\n')
+        for j, line in enumerate(translated_lines):
+            if j < len(chunk_lines):
+                translated_indices.append((text_indices[i+j], line))
+        
+        time.sleep(0.3)  # Rate Limit အတွက်
+    
+    # မူရင်း SRT ပုံစံအတိုင်း ပြန်တည်ဆောက်မယ်
     result_lines = lines.copy()
-    for idx, pos in enumerate(text_indices):
-        if idx < len(translated_lines):
-            result_lines[pos] = translated_lines[idx]
+    for idx, translated_text in translated_indices:
+        if idx < len(result_lines):
+            result_lines[idx] = translated_text
+    
     return '\n'.join(result_lines)
 
 # ============================================
@@ -257,12 +272,10 @@ def translate_command(message):
 
 def process_translate(message):
     try:
-        # Document ရှိမရှိ စစ်မယ်
         if not message.document:
             bot.reply_to(message, "❌ ဖိုင် (.srt) တစ်ခု ပို့ပါ။")
             return
         
-        # .srt ဖိုင်လား စစ်မယ်
         if not message.document.file_name.endswith('.srt'):
             bot.reply_to(message, "❌ .srt ဖိုင် သာ ပို့ပါ။")
             return
@@ -272,7 +285,9 @@ def process_translate(message):
         downloaded_file = bot.download_file(file_path.file_path)
         srt_content = downloaded_file.decode('utf-8')
         
-        status = bot.reply_to(message, "⏳ ဘာသာပြန်နေပါပြီ... (Gemini API)")
+        # SRT ဖိုင်ရဲ့ စာကြောင်းအရေအတွက်ကို ပြောပါ
+        line_count = len(srt_content.split('\n'))
+        status = bot.reply_to(message, f"⏳ ဘာသာပြန်နေပါပြီ... (စာကြောင်း {line_count} ကြောင်း) ခဏစောင့်ပါ။")
         
         # SRT ဖိုင်ကို ဘာသာပြန်မယ်
         translated_srt = translate_srt_full(srt_content)
@@ -292,7 +307,8 @@ def process_translate(message):
         
     except Exception as e:
         bot.reply_to(message, f"❌ အမှားဖြစ်သွားတယ်: {str(e)}")
-
+        # Error ရဲ့ အသေးစိတ်ကို Log ထဲမှာ ပြမယ်
+        print(f"❌ process_translate error: {e}")
 # ============================================
 # /tts - Voiceover (Edge TTS)
 # ============================================
