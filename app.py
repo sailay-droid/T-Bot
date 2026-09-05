@@ -338,12 +338,13 @@ def process_recap(message):
 # ၆။ Main Entry Point
 # ============================================
 if __name__ == '__main__':
-    webhook_url = RENDER_URL + '/webhook' if RENDER_URL else ''
-    if webhook_url and webhook_url.startswith('http'):
-        bot.remove_webhook()
-        bot.set_webhook(url=webhook_url)
-        print(f"✅ Webhook set to: {webhook_url}")
-    else:
-        print("⚠️ RENDER_EXTERNAL_URL not set, using polling mode.")
+    # Polling Mode ကို သုံးမယ်
+    print("🔄 Using polling mode...")
+    bot.remove_webhook()
+    
+    # Polling ကို Background Thread မှာ run မယ်
+    import threading
+    threading.Thread(target=bot.infinity_polling, daemon=True).start()
+    
     port = int(os.environ.get('PORT', 5000))
     app.run(host='0.0.0.0', port=port)
